@@ -1,0 +1,400 @@
+
+title: "STAT 380 Final Project"
+author: "Samarth Patel"
+date: "`r Sys.Date()`"
+output: html_document
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(randomForest) 
+library(e1071)         
+library(pROC)         
+
+set.seed(123)
+```
+
+```{r}
+# setup and data loading
+
+# load raw data
+
+features_raw <- read.csv("C:/Users/samar/Downloads/STAT 380-2/Project/features.csv",
+stringsAsFactors = FALSE)
+stores_raw   <- read.csv("C:/Users/samar/Downloads/STAT 380-2/Project/stores.csv",
+stringsAsFactors = FALSE)
+sales_raw    <- read.csv("C:/Users/samar/Downloads/STAT 380-2/Project/train.csv",
+stringsAsFactors = FALSE)
+
+# type fixes
+
+# convert Date to Date
+
+features_raw$Date <- as.Date(features_raw$Date)
+sales_raw$Date    <- as.Date(sales_raw$Date)
+
+# convert IsHoliday to logical
+
+features_raw$IsHoliday <- as.logical(features_raw$IsHoliday)
+sales_raw$IsHoliday    <- as.logical(sales_raw$IsHoliday)
+
+# store Type as factor
+
+stores_raw$Type <- as.factor(stores_raw$Type)
+
+# merge into a single dataset
+
+walmart <- sales_raw %>%
+left_join(stores_raw,   by = "Store") %>%
+left_join(features_raw, by = c("Store", "Date"))
+
+# combine IsHoliday.x / IsHoliday.y into single IsHoliday
+
+walmart <- walmart %>%
+mutate(IsHoliday = IsHoliday.x) %>%  # they should match
+select(-IsHoliday.x, -IsHoliday.y)
+
+glimpse(walmart)
+
+# handle missing values
+
+# numeric vs categorical/logical
+
+num_cols <- walmart %>%
+dplyr::select(where(is.numeric)) %>%
+colnames()
+
+cat_cols <- walmart %>%
+dplyr::select(where(function(x) is.character(x) || is.factor(x) || is.logical(x))) %>%
+colnames()
+
+# median impute numeric
+
+for (v in num_cols) {
+med <- median(walmart[[v]], na.rm = TRUE)
+walmart[[v]][is.na(walmart[[v]])] <- med
+}
+
+# mode helper for categorical / logical
+
+get_mode <- function(x) {
+ux <- na.omit(x)
+ux[which.max(tabulate(match(x, ux)))]
+}
+
+# mode impute categorical / logical
+
+for (v in cat_cols) {
+mode_val <- get_mode(walmart[[v]])
+walmart[[v]][is.na(walmart[[v]])] <- mode_val
+}
+
+# make sure types are correct
+
+if ("Type" %in% names(walmart)) {
+walmart$Type <- as.factor(walmart$Type)
+}
+if ("IsHoliday" %in% names(walmart)) {
+walmart$IsHoliday <- as.logical(walmart$IsHoliday)
+}
+```
+
+
+```{r}
+# feature engineering
+
+walmart <- walmart %>%
+mutate(
+Year  = year(Date),
+Month = month(Date),          # numeric month 1-12
+Week  = isoweek(Date),
+log_weekly_sales = ifelse(Weekly_Sales > 0, log(Weekly_Sales), NA_real_)
+)
+
+# drop rows where log_weekly_sales is NA (should be very few)
+
+walmart <- walmart %>%
+filter(!is.na(log_weekly_sales))
+
+summary(walmart$log_weekly_sales)
+```
+
+
+```{r}
+# RQ1 – monthly pattern in sales
+
+# how do average weekly sales vary across different months of the year?
+
+monthly_sales <- walmart %>%
+group_by(Month) %>%
+summarise(
+avg_weekly_sales    = mean(Weekly_Sales),
+median_weekly_sales = median(Weekly_Sales),
+n = n(),
+.groups = "drop"
+)
+
+monthly_sales
+
+ggplot(monthly_sales, aes(x = factor(Month), y = avg_weekly_sales)) +
+geom_col(fill = "steelblue") +
+labs(
+title = "Average Weekly Sales by Month",
+x = "Month (1 = Jan, 12 = Dec)",
+y = "Average Weekly Sales"
+) +
+theme_minimal()
+```
+
+
+```{r}
+# RQ2 – holiday vs non-holiday weeks
+
+# are average weekly sales higher in holiday weeks than in non-holiday weeks?
+
+holiday_summary <- walmart %>%
+group_by(IsHoliday) %>%
+summarise(
+avg_weekly_sales    = mean(Weekly_Sales),
+median_weekly_sales = median(Weekly_Sales),
+n = n(),
+.groups = "drop"
+)
+
+holiday_summary
+
+ggplot(holiday_summary, aes(x = IsHoliday, y = avg_weekly_sales)) +
+geom_col(fill ="red") +
+labs(
+title = "Average Weekly Sales: Holiday vs Non-holiday Weeks",
+x = "Is Holiday Week?",
+y = "Average Weekly Sales"
+) +
+theme_minimal()
+
+# t-test for difference in means (holiday vs non-holiday)
+
+t_test_result <- t.test(Weekly_Sales ~ IsHoliday, data = walmart)
+t_test_result
+```
+
+
+```{r}
+# RQ3 – unemployment vs weekly sales
+
+# is there a relationship between the local unemployment rate and weekly sales?
+
+# correlation between Weekly_Sales and Unemployment
+cor_unemp_sales <- cor(walmart$Weekly_Sales, walmart$Unemployment)
+cor_unemp_sales
+
+# Task 2 – polynomial regression model for sales 
+lm_sales <- lm(
+  Weekly_Sales ~ poly(Unemployment, 2, raw = TRUE) + IsHoliday + Month + Store + Size,
+  data = walmart
+)
+
+summary(lm_sales)
+
+# scatterplot with polynomial regression curve (sample for speed)
+set.seed(123)
+walmart_plot_sample <- walmart %>%
+  slice_sample(n = 5000)
+
+ggplot(walmart_plot_sample, aes(x = Unemployment, y = Weekly_Sales)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(
+    method = "lm",
+    formula = y ~ poly(x, 2, raw = TRUE),
+    se = TRUE,
+    color = "red"
+  ) +
+  labs(
+    title = "Weekly Sales vs Unemployment Rate (Polynomial Fit, Degree 2)",
+    x = "Unemployment Rate",
+    y = "Weekly Sales"
+  ) +
+  theme_minimal()
+
+```
+
+
+```{r}
+# Task 3 – classification
+
+# RQ: which model best predicts whether a store-week has High or Low sales?
+
+# create binary outcome: High vs Low sales
+
+sales_median <- median(walmart$Weekly_Sales, na.rm = TRUE)
+
+walmart <- walmart %>%
+mutate(
+High_Sales = if_else(Weekly_Sales >= sales_median, "High", "Low"),
+High_Sales = factor(High_Sales, levels = c("Low", "High"))
+)
+
+table(walmart$High_Sales)
+
+# build smaller modeling sample for classification (about 2,000 rows total)
+
+set.seed(123)
+walmart_clf <- walmart %>%
+filter(!is.na(High_Sales)) %>%
+group_by(High_Sales) %>%
+slice_sample(n = 1000) %>%   # 1000 from each class
+ungroup()
+
+nrow(walmart_clf)
+
+glimpse(walmart_clf)
+
+# train / test split for classification
+
+set.seed(123)
+n_clf <- nrow(walmart_clf)
+train_idx_clf <- sample(1:n_clf, size = floor(0.7 * n_clf))
+
+train_data <- walmart_clf[train_idx_clf, ]
+test_data  <- walmart_clf[-train_idx_clf, ]
+
+table(train_data$High_Sales)
+table(test_data$High_Sales)
+
+# helper for accuracy
+
+accuracy <- function(pred, truth) {
+mean(pred == truth)
+}
+
+# predictor set for classification (keep it simple)
+
+predictors_clf <- c(
+"Store", "Size",
+"Temperature", "Fuel_Price", "CPI", "Unemployment",
+"IsHoliday", "Year", "Week"
+)
+
+predictors_clf <- predictors_clf[predictors_clf %in% names(train_data)]
+predictors_clf
+
+formula_clf <- as.formula(
+paste("High_Sales ~", paste(predictors_clf, collapse = " + "))
+)
+```
+
+
+```{r}
+# logistic regression 
+
+logit_model <- glm(formula_clf, data = train_data, family = binomial)
+summary(logit_model)
+
+logit_prob <- predict(logit_model, newdata = test_data, type = "response")
+logit_pred <- ifelse(logit_prob >= 0.5, "High", "Low") |>
+factor(levels = c("Low", "High"))
+
+table(Predicted = logit_pred, Actual = test_data$High_Sales)
+
+roc_logit <- roc(test_data$High_Sales, logit_prob, levels = c("Low", "High"))
+auc_logit <- auc(roc_logit)
+auc_logit
+
+acc_logit <- accuracy(logit_pred, test_data$High_Sales)
+acc_logit
+```
+
+
+```{r}
+# random forest 
+
+set.seed(123)
+rf_model <- randomForest(
+formula_clf,
+data = train_data,
+ntree = 50,   # small number of trees
+mtry = 3,
+importance = TRUE
+)
+
+rf_prob <- predict(rf_model, newdata = test_data, type = "prob")
+rf_pred <- ifelse(rf_prob[, "High"] >= 0.5, "High", "Low") |>
+factor(levels = c("Low", "High"))
+
+table(Predicted = rf_pred, Actual = test_data$High_Sales)
+
+roc_rf <- roc(test_data$High_Sales, rf_prob[, "High"], levels = c("Low", "High"))
+auc_rf <- auc(roc_rf)
+auc_rf
+
+acc_rf <- accuracy(rf_pred, test_data$High_Sales)
+acc_rf
+
+# variable importance plot (optional)
+
+varImpPlot(rf_model)
+```
+
+
+```{r}
+# naive Bayes
+
+nb_model <- naiveBayes(formula_clf, data = train_data)
+
+nb_prob <- predict(nb_model, newdata = test_data, type = "raw")[, "High"]
+nb_pred <- ifelse(nb_prob >= 0.5, "High", "Low") |>
+factor(levels = c("Low", "High"))
+
+table(Predicted = nb_pred, Actual = test_data$High_Sales)
+
+roc_nb <- roc(test_data$High_Sales, nb_prob, levels = c("Low", "High"))
+auc_nb <- auc(roc_nb)
+auc_nb
+
+acc_nb <- accuracy(nb_pred, test_data$High_Sales)
+acc_nb
+```
+
+
+```{r}
+# model comparison summary for Task 3
+
+model_summary <- tibble(
+Model    = c("Logistic Regression", "Random Forest", "Naive Bayes"),
+AUC      = c(as.numeric(auc_logit),
+as.numeric(auc_rf),
+as.numeric(auc_nb)),
+Accuracy = c(acc_logit, acc_rf, acc_nb)
+)
+
+model_summary
+```
+
+
+```{r}
+# simple printed summary for the write-up
+
+cat("RQ1 – Monthly pattern in sales\n")
+print(monthly_sales)
+cat("\n")
+
+cat("RQ2 – Holiday vs non-holiday weeks\n")
+print(holiday_summary)
+cat("\n")
+cat("t-test p-value (Weekly_Sales ~ IsHoliday):", t_test_result$p.value, "\n\n")
+
+cat("RQ3 – Unemployment vs weekly sales\n")
+cat("Correlation between Weekly_Sales and Unemployment:", cor_unemp_sales, "\n")
+cat("See regression summary for lm_sales for the effect of Unemployment and controls.\n\n")
+
+cat("Task 3 – Classification: High vs Low sales\n")
+print(model_summary)
+cat("\n")
+cat("Best model can be chosen by highest AUC (and/or accuracy).\n")
+
+```
